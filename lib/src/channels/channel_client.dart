@@ -1,6 +1,5 @@
 import '../common/common.dart';
 import '../extensions/helpers_extension.dart';
-import '../playlists/playlists.dart';
 import '../reverse_engineering/pages/channel_about_page.dart';
 import '../reverse_engineering/pages/channel_page.dart';
 import '../reverse_engineering/pages/channel_upload_page.dart';
@@ -128,10 +127,22 @@ class ChannelClient {
 
   /// Enumerates videos uploaded by the specified channel.
   /// If you want a full list of uploads see [getUploadsFromPage]
-  Stream<Video> getUploads(dynamic channelId) {
+  Stream<Video> getUploads(dynamic channelId) async* {
     channelId = ChannelId.fromString(channelId);
-    final playlistId = 'UU${(channelId.value as String).substringAfter('UC')}';
-    return PlaylistClient(_httpClient).getVideos(PlaylistId(playlistId));
+    var list = await getUploadsFromPage(channelId as ChannelId);
+    final encountered = <String>{};
+    var previous = 0;
+
+    while (list.isNotEmpty) {
+      for (final video in list) {
+        if (encountered.add(video.id.value)) {
+          yield video;
+        }
+      }
+      if (encountered.length == previous) break;
+      previous = encountered.length;
+      list = await list.nextPage() ?? list;
+    }
   }
 
   /// Enumerates videos uploaded by the specified channel.

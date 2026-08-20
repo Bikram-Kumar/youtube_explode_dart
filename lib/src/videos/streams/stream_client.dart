@@ -105,13 +105,34 @@ class StreamClient {
             );
           }
 
-          final response = await _httpClient.head(streams.first.url);
-          if (response.statusCode == 403) {
-            throw YoutubeExplodeException(
-              'Video $videoId returned 403 (stream: ${streams.first.tag})',
-            );
+          // Some clients (e.g. androidSdkless, ios) return non-muxed streams
+          // that require Range requests and 403 on a plain GET/HEAD.
+          // If the first non-muxed stream is not accessible, keep only muxed.
+          var addable = streams;
+          StreamInfo? firstNonMuxed;
+          for (final s in streams) {
+            if (s is! MuxedStreamInfo) {
+              firstNonMuxed = s;
+              break;
+            }
           }
-          uniqueStreams.addAll(streams);
+          if (firstNonMuxed != null) {
+            try {
+              final response = await _httpClient.head(firstNonMuxed.url);
+              if (response.statusCode >= 400) {
+                addable = streams.whereType<MuxedStreamInfo>().toList();
+              }
+            } catch (e, s) {
+              _logger.fine(
+                'Non-muxed stream ${firstNonMuxed.tag} not accessible for video $videoId: $e',
+                e,
+                s,
+              );
+              addable = streams.whereType<MuxedStreamInfo>().toList();
+            }
+          }
+
+          uniqueStreams.addAll(addable);
         });
       } catch (e, s) {
         _logger.severe(
@@ -135,6 +156,7 @@ class StreamClient {
           VideoUnavailableException(
               'Video "$videoId" has no available streams');
     }
+
     return StreamManifest(uniqueStreams.toList());
   }
 
@@ -151,6 +173,11 @@ class StreamClient {
       );
     }
 
+    final hlsManifest = playerResponse.hlsManifestUrl;
+    if (hlsManifest != null) {
+      return hlsManifest;
+    }
+
     if (!playerResponse.isVideoPlayable) {
       throw VideoUnplayableException.unplayable(
         videoId,
@@ -158,11 +185,7 @@ class StreamClient {
       );
     }
 
-    final hlsManifest = playerResponse.hlsManifestUrl;
-    if (hlsManifest == null) {
-      throw VideoUnplayableException.notLiveStream(videoId);
-    }
-    return hlsManifest;
+    throw VideoUnplayableException.notLiveStream(videoId);
   }
 
   /// Gets the actual stream which is identified by the specified metadata.

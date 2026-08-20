@@ -4,6 +4,7 @@ import 'package:html/parser.dart' as parser;
 import '../../../youtube_explode_dart.dart';
 import '../../extensions/helpers_extension.dart';
 import '../../retry.dart';
+
 import '../models/initial_data.dart';
 import '../models/youtube_page.dart';
 import '../youtube_http_client.dart';
@@ -47,7 +48,9 @@ class PlaylistPage extends YoutubePage<_InitialData> {
     final url = 'https://www.youtube.com/playlist?list=$id&hl=en&persist_hl=1';
     return retry(httpClient, () async {
       final raw = await httpClient.getString(url);
-      final page = PlaylistPage.parse(raw, id);
+      final parsed = PlaylistPage.parse(raw, id);
+      final page = PlaylistPage.id(
+          id, parsed.initialData, parsed.initialData.visitorData);
       if (page.initialData.exists && page.videos.isNotEmpty) return page;
 
       // Fallback: fetch via the browse API. Needed for Mixes and YT Music playlists
@@ -137,8 +140,27 @@ class _InitialData extends InitialData {
   }();
 
   String? get continuationToken {
+    // New layout: continuation is a sibling of the itemSectionRenderer.
+    final sectionList = root.getJson<List<dynamic>>(
+        'contents/twoColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents');
+    final directToken = sectionList
+        ?.cast<JsonMap>()
+        .firstWhereOrNull((e) => e['continuationItemViewModel'] != null)
+        ?.getJson<JsonMap>(
+            'continuationItemViewModel/continuationCommand/innertubeCommand/continuationCommand')
+        ?.getT<String>('token');
+    if (directToken != null) return directToken;
+
     final items = _videoItems;
     if (items == null) return null;
+
+    // New layout: continuation is a view model.
+    final viewModelToken = items
+        .firstWhereOrNull((e) => e['continuationItemViewModel'] != null)
+        ?.getJson<JsonMap>(
+            'continuationItemViewModel/continuationCommand/innertubeCommand/continuationCommand')
+        ?.getT<String>('token');
+    if (viewModelToken != null) return viewModelToken;
 
     final endpoint = items
         .firstWhereOrNull((e) => e['continuationItemRenderer'] != null)
@@ -194,6 +216,12 @@ class _InitialData extends InitialData {
               item.getJson<List<dynamic>>('playlistVideoListRenderer/contents');
           if (contents != null) return contents.cast<JsonMap>();
         }
+
+        // New layout: the section contains lockupViewModel items directly.
+        if (itemContents.any((e) =>
+            (e as JsonMap?)?.containsKey('lockupViewModel') ?? false)) {
+          return itemContents.cast<JsonMap>();
+        }
       }
     }
     return null;
@@ -204,13 +232,117 @@ class _InitialData extends InitialData {
     if (items == null) return const [];
 
     return items
-        .map((item) =>
-            item['playlistVideoRenderer'] as JsonMap? ??
-            item['richItemRenderer']?['content']?['playlistVideoRenderer']
-                as JsonMap?)
+        .map((item) {
+          if (item['playlistVideoRenderer'] != null) {
+            return item['playlistVideoRenderer'] as JsonMap;
+          }
+          final richItemRenderer =
+              item['richItemRenderer']?['content']?['playlistVideoRenderer']
+                  as JsonMap?;
+          if (richItemRenderer != null) return richItemRenderer;
+
+          final lockup = item['lockupViewModel'] as JsonMap?;
+          if (lockup != null) return _VideoData.fromLockupViewModel(lockup);
+
+          return null;
+        })
         .nonNulls
         .map(_Video.new)
         .toList();
+  }
+}
+
+class _VideoData {
+  static JsonMap _textRuns(String text, {String? channelId}) {
+    final run = <String, dynamic>{'text': text};
+    if (channelId != null) {
+      run['navigationEndpoint'] = {
+        'browseEndpoint': {'browseId': channelId}
+      };
+    }
+    return {'runs': <JsonMap>[run]};
+  }
+
+  static JsonMap fromLockupViewModel(JsonMap lockup) {
+    final videoId = lockup.getT<String>('contentId') ?? '';
+    final title = lockup.getJson<String>(
+            'metadata/lockupMetadataViewModel/title/content') ??
+        '';
+
+    final metadata = lockup.getJson<JsonMap>(
+        'metadata/lockupMetadataViewModel/metadata/contentMetadataViewModel');
+    final rows = metadata
+            ?.getJson<List<dynamic>>('metadataRows')
+            ?.cast<JsonMap>() ??
+        const [];
+
+    String author = '';
+    String viewCountText = '';
+    String? uploadDateText;
+    if (rows.isNotEmpty) {
+      final firstRowParts = rows.first
+              .getJson<List<dynamic>>('metadataParts')
+              ?.cast<JsonMap>() ??
+          const [];
+      if (firstRowParts.isNotEmpty) {
+        author = firstRowParts.first.getJson<String>('text/content') ?? '';
+      }
+    }
+    if (rows.length > 1) {
+      final secondRowParts = rows[1]
+              .getJson<List<dynamic>>('metadataParts')
+              ?.cast<JsonMap>() ??
+          const [];
+      if (secondRowParts.isNotEmpty) {
+        viewCountText = secondRowParts.first.getJson<String>('text/content') ?? '';
+      }
+      if (secondRowParts.length > 1) {
+        uploadDateText = secondRowParts[1].getJson<String>('text/content');
+      }
+    }
+
+    var channelId = lockup.getJson<String>(
+            'metadata/lockupMetadataViewModel/image/decoratedAvatarViewModel/rendererContext/commandContext/onTap/innertubeCommand/browseEndpoint/browseId') ??
+        '';
+    if (channelId.isEmpty && rows.isNotEmpty) {
+      final firstRowParts = rows.first
+              .getJson<List<dynamic>>('metadataParts')
+              ?.cast<JsonMap>() ??
+          const [];
+      if (firstRowParts.isNotEmpty) {
+        channelId = firstRowParts.first.getJson<String>(
+                'text/commandRuns/0/onTap/innertubeCommand/browseEndpoint/browseId') ??
+            '';
+      }
+    }
+
+    var duration = '';
+    final overlays = lockup
+            .getJson<List<dynamic>>('contentImage/thumbnailViewModel/overlays')
+            ?.cast<JsonMap>() ??
+        const [];
+    for (final overlay in overlays) {
+      final badges = overlay
+          .getJson<List<dynamic>>('thumbnailBottomOverlayViewModel/badges')
+          ?.cast<JsonMap>();
+      if (badges != null && badges.isNotEmpty) {
+        duration = badges.first.getJson<String>('thumbnailBadgeViewModel/text') ?? '';
+        break;
+      }
+    }
+
+    final videoInfoRuns = <JsonMap>[
+      {'text': viewCountText},
+      if (uploadDateText != null) {'text': uploadDateText},
+    ];
+
+    return <String, dynamic>{
+      'videoId': videoId,
+      'title': _textRuns(title),
+      'ownerText': _textRuns(author, channelId: channelId),
+      'lengthText': {'simpleText': duration},
+      'videoInfo': {'runs': videoInfoRuns},
+    };
   }
 }
 
